@@ -10,7 +10,6 @@ const connectDB = require('./config/mongoose-connection');
 // Connect to the database
 connectDB();
 
-// Middleware
 app.use(cookieParser());
 app.use(helmet());
 app.use(cors());
@@ -18,7 +17,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Routes
-app.use('/', authRoutes);
+app.use('/auth', authRoutes);
 
 // Start the server
 const PORT = process.env.PORT || 3000;

@@ -2,7 +2,7 @@ const User = require('../models/userModel');
 const sendEmail = require('../utils/sendEmail')
 const {generateOtp, hashOtp} = require('../utils/generateOtp') 
 const verifyOtp = require('../utils/verifyOtp')
-const generateState = require('../utils/generateState');
+const { randomState, randomNonce, randomPKCECodeVerifier, calculatePKCECodeChallenge, buildAuthorizationUrl, authorizationCodeGrant } = require("openid-client")
 const initOpenId = require('../config/open_id_client');
 const redisClient = require('../config/redis');
 const jwt = require('jsonwebtoken');
@@ -12,7 +12,7 @@ const register = async (req,res) => {
         const {username, email, password} = req.body;
         const existingUser = await User.findOne({email});
         if(existingUser){
-            return res.status(400).json('invalid credentials')
+            return res.status(400).json('User already registered')
         }
         const hashedPassword = await User.prototype.hashPassword(password);   
         const createdUser = new User({username, email, password: hashedPassword});
@@ -54,12 +54,13 @@ const refreshToken = async (req,res) => {
         if(!refreshToken){
            return res.status(404).json('Unauthorized Request')
         }
-
-        const decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET)
+        
+        const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
         const user = await User.findOne({_id: decoded.id})
         if(!user){
             return res.status(404).json('Unauthorized Request')
         }
+
         const accessToken = user.generateAuthToken();
         const newRefreshToken = user.generateRefreshToken();
         user.refreshToken = newRefreshToken;
@@ -151,51 +152,118 @@ const getProfile = async (req,res) => {
 
 const loginWithGoogle = async (req, res) => {
     try{
-        const { client, generators } = await initOpenId();
-        const state = generateState(16);
-        const codeVerifier = await generators.generateCodeVerifier();
-        const codeChallenge = await generators.generateCodeChallenge(codeVerifier);
-        await redisClient.set(state, codeVerifier);
-        const url = client.authorizationUrl({
+
+        const config = await initOpenId();
+        const state = randomState();
+        const nonce = randomNonce();
+        const codeVerifier = randomPKCECodeVerifier();
+        const codeChallenge = await calculatePKCECodeChallenge(codeVerifier);
+        await redisClient.set(`google:${state}`,JSON.stringify({codeVerifier, nonce}), {EX: 300});
+
+        const url = buildAuthorizationUrl( config, {
+            redirect_uri: process.env.REDIRECT_URI,
+            response_type: 'code',
             scope: 'openid email profile',
             code_challenge: codeChallenge,
             code_challenge_method: 'S256',
-            state: state
+            state: state,
+            nonce : nonce
         });
-        return res.status(200).json({url});
+
+        return res.redirect(url).json('redirecting to google');
+
     } catch (error) {
-        return res.status(500).json('Server Internal error');
+        return res.json({
+            error : error.message,
+            stack : error.stack
+        })
     }
 };
 
-const googleCallback = async (req, res) => {
-    try { 
-        const { client } = await initOpenId();
-        const params = client.callbackParams(req);
-        const state = params.state;
-        const existingState = redisClient.get(state)
-        if(!existingState){
-        return res.status(401).json('Invalid state parameter');
-        }
-        const tokenSet = await client.callback(process.env.REDIRECT_URI, params, {code_verifier: existingState});
-        const userInfo = await client.userinfo(tokenSet.access_token);
-        let user = await User.findOne({email: userInfo.email});
-        if(!user){ 
-            user = new User({ _id: userInfo.sub, email: userInfo.email, name: userInfo.name }); 
-            await user.save();
-        }   
-        const accessToken = user.generateAuthToken();   
-        const refreshToken = user.generateRefreshToken();   
-        user.refreshToken = refreshToken;   
-        await user.save(); 
-        req.headers['authorization'] = `Bearer ${accessToken}`;
-        res.cookie('refresh-token', refreshToken, {httpOnly: true, secure: false}); 
-        return res.status(200).json({accessToken, refreshToken});    
-} catch (error) {
-    return res.status(500).json('Server Internal error');
-        }
+try {
+    const { code, state } = req.query;
 
-};
+    if (!code || !state) {
+        return res.status(400).json("Invalid request");
+    }
+
+    const config = await initOpenId();
+
+    const stateData = await redisClient.get(`google:${state}`);
+
+    if (!stateData) {
+        return res.status(400).json("Invalid request");
+    }
+
+    const { codeVerifier, nonce } = JSON.parse(stateData);
+
+    const tokenSet = await authorizationCodeGrant(
+        config,
+        new URL(
+            `${process.env.REDIRECT_URI}?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+        ),
+        {
+            expectedState: state,
+            expectedNonce: nonce,
+            pkceCodeVerifier: codeVerifier,
+            idTokenExpected: true
+        }
+    );
+
+    // Get Google identity
+    const claims = tokenSet.claims();
+
+    const {
+        sub: googleId,
+        email,
+        name,
+        picture,
+        email_verified
+    } = claims;
+
+    // State should only be usable once
+    await redisClient.del(`google:${state}`);
+
+    if (!email || !email_verified) {
+        return res.status(400).json("Google email is not verified");
+    }
+
+    let user = await User.findOne({ email });
+
+    if (!user) {
+        user = new User({
+            email,
+            username : name,
+            password : null,
+        });
+        await user.save();
+    }
+
+    const accessToken = user.generateAuthToken();
+    const refreshToken = user.generateRefreshToken();
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    req.headers['authorization'] = `Bearer ${accessToken}`;
+
+    res.cookie('refresh-token', refreshToken, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        maxAge: 1000 * 60 * 60 * 24 * 7
+    });
+
+    return res.json({
+        message: "Google login successful"
+    });
+
+} catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+        message: "Google authentication failed"
+    });
+}
 
 const logout = async (req, res) => {
     try {
